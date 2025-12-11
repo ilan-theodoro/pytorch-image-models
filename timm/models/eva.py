@@ -810,7 +810,22 @@ class Eva(nn.Module):
         if self.rope is not None:
             self.rope.update_feat_shape(self.patch_embed.grid_size)
 
-    def _pos_embed(self, x) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _pos_embed(
+            self,
+            x: torch.Tensor,
+            coords: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply position embeddings and compute rotary position embeddings.
+
+        Args:
+            x: Input tensor from patch embedding.
+            coords: Optional continuous 2D coordinates of shape (N, 2) or (B, N, 2).
+                If None, uses standard grid-based positions.
+                If provided, uses these coordinates for RoPE computation.
+
+        Returns:
+            Tuple of (position-embedded tensor, rotary position embedding tensor).
+        """
         if self.dynamic_img_size:
             B, H, W, C = x.shape
             if self.pos_embed is not None:
@@ -824,10 +839,22 @@ class Eva(nn.Module):
             else:
                 pos_embed = None
             x = x.view(B, -1, C)
-            rot_pos_embed = self.rope.get_embed(shape=(H, W)) if self.rope is not None else None
+            if self.rope is not None:
+                if coords is not None:
+                    rot_pos_embed = self.rope.get_embed_from_coords(coords)
+                else:
+                    rot_pos_embed = self.rope.get_embed(shape=(H, W))
+            else:
+                rot_pos_embed = None
         else:
             pos_embed = self.pos_embed
-            rot_pos_embed = self.rope.get_embed() if self.rope is not None else None
+            if self.rope is not None:
+                if coords is not None:
+                    rot_pos_embed = self.rope.get_embed_from_coords(coords)
+                else:
+                    rot_pos_embed = self.rope.get_embed()
+            else:
+                rot_pos_embed = None
 
         to_cat = []
         if self.cls_token is not None:
@@ -964,17 +991,25 @@ class Eva(nn.Module):
         x = global_pool_nlc(x, pool_type=pool_type, num_prefix_tokens=self.num_prefix_tokens)
         return x
 
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(
+            self,
+            x: torch.Tensor,
+            coords: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Forward pass through feature extraction layers.
 
         Args:
             x: Input tensor.
+            coords: Optional continuous 2D coordinates of shape (N, 2) or (B, N, 2).
+                If None, uses standard grid-based positions for RoPE.
+                If provided, uses these coordinates for RoPE computation,
+                enabling sub-pixel or interpolated positions.
 
         Returns:
             Feature tensor.
         """
         x = self.patch_embed(x)
-        x, rot_pos_embed = self._pos_embed(x)
+        x, rot_pos_embed = self._pos_embed(x, coords=coords)
         x = self.norm_pre(x)
 
         if getattr(self, 'rope_mixed', False) and rot_pos_embed is not None:
@@ -1011,16 +1046,23 @@ class Eva(nn.Module):
         x = self.head_drop(x)
         return x if pre_logits else self.head(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            coords: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: Input tensor.
+            coords: Optional continuous 2D coordinates of shape (N, 2) or (B, N, 2).
+                If None, uses standard grid-based positions for RoPE.
+                If provided, uses these coordinates for RoPE computation.
 
         Returns:
             Output tensor.
         """
-        x = self.forward_features(x)
+        x = self.forward_features(x, coords=coords)
         x = self.forward_head(x)
         return x
 
@@ -2935,3 +2977,137 @@ def vit_7b_patch16_dinov3(pretrained: bool = False, **kwargs) -> Eva:
 
     model = _create_eva('vit_7b_patch16_dinov3', pretrained=pretrained, **dict(model_args, **kwargs))
     return model
+
+
+if __name__ == "__main__":
+    """Test that continuous coordinate RoPE implementation is correct.
+
+    This test verifies:
+    1. Using explicit integer grid coordinates produces identical results to default behavior
+    2. Using slightly perturbed (continuous) coordinates produces different results
+    """
+    import torch
+
+    print("=" * 70)
+    print("Testing Continuous Coordinate RoPE Implementation in Eva")
+    print("=" * 70)
+
+    # Create a small EVA model with RoPE enabled
+    model = Eva(
+        img_size=224,
+        patch_size=16,
+        embed_dim=192,
+        depth=4,
+        num_heads=3,
+        use_rot_pos_emb=True,
+        use_abs_pos_emb=False,
+        class_token=True,
+        num_reg_tokens=0,
+    )
+    model.eval()
+
+    # Get grid size
+    H, W = model.patch_embed.grid_size  # 14x14 for 224/16
+    N = H * W  # 196 patches
+    print(f"\nModel config: embed_dim=192, depth=4, num_heads=3")
+    print(f"Patch grid: {H}x{W} = {N} patches")
+
+    # Create test input
+    torch.manual_seed(42)
+    x = torch.randn(1, 3, 224, 224)
+
+    # Test 1: Default behavior (no coords provided)
+    print("\n" + "-" * 70)
+    print("Test 1: Default grid-based RoPE (no coords argument)")
+    print("-" * 70)
+    with torch.no_grad():
+        output_default = model(x, coords=None)
+    print(f"Output shape: {output_default.shape}")
+    print(f"Output sum: {output_default.sum().item():.6f}")
+
+    # Test 2: Explicit integer grid coordinates (should match default)
+    print("\n" + "-" * 70)
+    print("Test 2: Explicit integer grid coordinates (should match default)")
+    print("-" * 70)
+
+    # Build integer grid coordinates matching what get_embed() produces internally
+    # For grid_indexing='ij': coords are (row, col) order
+    grid_y, grid_x = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32),
+        torch.arange(W, dtype=torch.float32),
+        indexing='ij'
+    )
+    coords_integer = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=-1)  # (N, 2)
+    print(f"Integer coords shape: {coords_integer.shape}")
+    print(f"First 5 coords: {coords_integer[:5].tolist()}")
+
+    with torch.no_grad():
+        output_explicit = model(x, coords=coords_integer)
+    print(f"Output shape: {output_explicit.shape}")
+    print(f"Output sum: {output_explicit.sum().item():.6f}")
+
+    # Check if they match
+    match = torch.allclose(output_default, output_explicit, atol=1e-5)
+    max_diff = (output_default - output_explicit).abs().max().item()
+    print(f"\nOutputs match (atol=1e-5): {match}")
+    print(f"Max difference: {max_diff:.2e}")
+
+    assert match, f"FAILED: Integer grid coords should produce identical results! Max diff: {max_diff}"
+    print("✓ PASSED: Integer grid coordinates produce identical results")
+
+    # Test 3: Perturbed continuous coordinates (should be different)
+    print("\n" + "-" * 70)
+    print("Test 3: Perturbed continuous coordinates (should be different)")
+    print("-" * 70)
+
+    # Add small perturbation to coordinates
+    perturbation = 0.1
+    coords_perturbed = coords_integer + perturbation
+    print(f"Perturbation: {perturbation}")
+    print(f"First 5 perturbed coords: {coords_perturbed[:5].tolist()}")
+
+    with torch.no_grad():
+        output_perturbed = model(x, coords=coords_perturbed)
+    print(f"Output shape: {output_perturbed.shape}")
+    print(f"Output sum: {output_perturbed.sum().item():.6f}")
+
+    # Check that they are different
+    different = not torch.allclose(output_default, output_perturbed, atol=1e-5)
+    max_diff_perturbed = (output_default - output_perturbed).abs().max().item()
+    print(f"\nOutputs different (atol=1e-5): {different}")
+    print(f"Max difference from default: {max_diff_perturbed:.2e}")
+
+    assert different, "FAILED: Perturbed coords should produce different results!"
+    print("✓ PASSED: Perturbed coordinates produce different results")
+
+    # Test 4: Fractional coordinates (sub-pixel positions)
+    print("\n" + "-" * 70)
+    print("Test 4: Fractional/sub-pixel coordinates")
+    print("-" * 70)
+
+    # Create coordinates with fractional values
+    coords_fractional = coords_integer + 0.5  # Center of each patch
+    print(f"Fractional coords (center of patches): first 5 = {coords_fractional[:5].tolist()}")
+
+    with torch.no_grad():
+        output_fractional = model(x, coords=coords_fractional)
+    print(f"Output shape: {output_fractional.shape}")
+    print(f"Output sum: {output_fractional.sum().item():.6f}")
+
+    different_frac = not torch.allclose(output_default, output_fractional, atol=1e-5)
+    max_diff_frac = (output_default - output_fractional).abs().max().item()
+    print(f"\nOutputs different from default: {different_frac}")
+    print(f"Max difference: {max_diff_frac:.2e}")
+
+    assert different_frac, "FAILED: Fractional coords should produce different results!"
+    print("✓ PASSED: Fractional coordinates produce different results")
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("ALL TESTS PASSED!")
+    print("=" * 70)
+    print("\nSummary:")
+    print("  - Integer grid coords = Default behavior ✓")
+    print("  - Perturbed coords produce different results ✓")
+    print("  - Fractional coords produce different results ✓")
+    print("\nContinuous coordinate RoPE is working correctly!")

@@ -127,6 +127,7 @@ from .pos_embed_sincos import (
     build_sincos2d_pos_embed,
     build_fourier_pos_embed,
     build_rotary_pos_embed,
+    build_rope_embed_from_coords,
     apply_rot_embed,
     apply_rot_embed_cat,
     apply_rot_embed_list,
@@ -137,6 +138,7 @@ from .pos_embed_sincos import (
     RotaryEmbeddingMixed,
     RotaryEmbeddingDinoV3,
     get_mixed_freqs,
+    get_mixed_freqs_from_coords,
     create_rope_embed,
 )
 from .squeeze_excite import SEModule, SqueezeExcite, EffectiveSEModule, EffectiveSqueezeExcite

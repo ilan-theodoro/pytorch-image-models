@@ -380,6 +380,77 @@ def build_rotary_pos_embed(
     return sin_emb, cos_emb
 
 
+def build_rope_embed_from_coords(
+        coords: torch.Tensor,
+        bands: Optional[torch.Tensor] = None,
+        dim: int = 64,
+        temperature: float = 10000.,
+        in_pixels: bool = False,
+        max_res: int = 224,
+        linear_bands: bool = False,
+        dtype: torch.dtype = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build rotary position embeddings from arbitrary continuous 2D coordinates.
+
+    This function allows computing RoPE embeddings for floating-point positions,
+    enabling use cases like sub-pixel positions, interpolated positions, or
+    non-uniform spatial sampling.
+
+    Args:
+        coords: Tensor of shape (N, 2) with continuous (y, x) or (row, col) positions.
+            Positions can be any floating-point values.
+        bands: Optional pre-computed frequency bands. If None, computed from temperature.
+        dim: Output dimension of embedding tensor (must be divisible by 4).
+        temperature: Temperature (inverse frequency) for band computation.
+        in_pixels: If True, use pixel frequency bands; otherwise use standard RoPE bands.
+        max_res: Maximum resolution for pixel mode band computation.
+        linear_bands: Use linear (vs log) spacing for pixel mode bands.
+        dtype: Output dtype.
+
+    Returns:
+        Tuple of (sin_emb, cos_emb), each of shape (N, dim).
+    """
+    assert dim % 4 == 0, f"dim must be divisible by 4, got {dim}"
+    num_bands = dim // 4
+    device = coords.device
+
+    if bands is None:
+        if in_pixels:
+            bands = pixel_freq_bands(
+                num_bands,
+                float(max_res),
+                linear_bands=linear_bands,
+                device=device,
+            )
+        else:
+            bands = freq_bands(
+                num_bands,
+                temperature=temperature,
+                step=1,
+                device=device,
+            )
+    else:
+        bands = bands.to(device)
+
+    # coords: (N, 2), bands: (num_bands,)
+    # Expand coords for broadcasting: (N, 2, 1)
+    coords_expanded = coords.unsqueeze(-1).float()
+
+    # Compute position * frequency: (N, 2, num_bands)
+    pos = coords_expanded * bands
+
+    # Compute sin/cos: (N, 2, num_bands)
+    pos_sin = pos.sin().to(dtype=dtype)
+    pos_cos = pos.cos().to(dtype=dtype)
+
+    # Flatten and repeat_interleave to match build_rotary_pos_embed output format
+    # (N, 2, num_bands) -> (N, 2*num_bands) -> (N, 4*num_bands) = (N, dim)
+    sin_emb = pos_sin.flatten(1).repeat_interleave(2, -1)
+    cos_emb = pos_cos.flatten(1).repeat_interleave(2, -1)
+
+    return sin_emb, cos_emb
+
+
 class RotaryEmbedding(nn.Module):
     """ Rotary position embedding
 
@@ -608,6 +679,72 @@ class RotaryEmbeddingCat(nn.Module):
         else:
             assert False, "get_embed() requires pre-computed pos embed or valid shape w/ pre-computed bands"
 
+    def get_embed_from_coords(
+            self,
+            coords: torch.Tensor,
+            dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """Generate RoPE embeddings for arbitrary continuous 2D coordinates.
+
+        This method allows computing RoPE embeddings for floating-point positions,
+        enabling use cases like sub-pixel positions, interpolated positions, or
+        non-uniform spatial sampling.
+
+        Args:
+            coords: Tensor of shape (N, 2) or (B, N, 2) with continuous (y, x) positions.
+                Positions can be any floating-point values. The coordinate order follows
+                self.grid_indexing: 'ij' means (row, col), 'xy' means (x, y).
+            dtype: Output dtype. If None, uses torch.float32.
+
+        Returns:
+            Tensor of shape (N, 2*dim) or (B, N, 2*dim) with concatenated [sin, cos] embeddings.
+
+        Raises:
+            RuntimeError: If bands are not available (i.e., feat_shape was provided at init).
+        """
+        if self.bands is None:
+            raise RuntimeError(
+                "get_embed_from_coords() requires cached bands. "
+                "Initialize RotaryEmbeddingCat without feat_shape to enable this method."
+            )
+
+        if dtype is None:
+            dtype = torch.float32
+
+        # Handle both (N, 2) and (B, N, 2) inputs
+        input_ndim = coords.ndim
+        if input_ndim == 2:
+            # (N, 2) -> compute directly
+            sin_emb, cos_emb = build_rope_embed_from_coords(
+                coords,
+                bands=self.bands,
+                dim=self.dim,
+                temperature=self.temperature,
+                in_pixels=self.in_pixels,
+                max_res=self.max_res,
+                linear_bands=self.linear_bands,
+                dtype=dtype,
+            )
+            return torch.cat([sin_emb, cos_emb], dim=-1)
+        elif input_ndim == 3:
+            # (B, N, 2) -> flatten, compute, reshape
+            B, N, _ = coords.shape
+            coords_flat = coords.reshape(B * N, 2)
+            sin_emb, cos_emb = build_rope_embed_from_coords(
+                coords_flat,
+                bands=self.bands,
+                dim=self.dim,
+                temperature=self.temperature,
+                in_pixels=self.in_pixels,
+                max_res=self.max_res,
+                linear_bands=self.linear_bands,
+                dtype=dtype,
+            )
+            rope_embed = torch.cat([sin_emb, cos_emb], dim=-1)
+            return rope_embed.reshape(B, N, -1)
+        else:
+            raise ValueError(f"coords must be 2D (N, 2) or 3D (B, N, 2), got {input_ndim}D")
+
     def get_batch_embeds(
             self,
             shapes: List[Tuple[int, int]],
@@ -726,17 +863,57 @@ def get_mixed_freqs(
         t_x: torch.Tensor,
         t_y: torch.Tensor,
 ) -> torch.Tensor:
-    """Compute mixed (learnable) frequencies."""
-    # Create position indices
+    """Compute mixed (learnable) frequencies.
+
+    Args:
+        freqs: Learnable frequency parameters of shape (2, depth, num_heads, head_dim//2)
+        t_x: X/row coordinates of shape (N,)
+        t_y: Y/col coordinates of shape (N,)
+
+    Returns:
+        Tensor of shape (depth, num_heads, N, head_dim*2) with concatenated sin/cos embeddings
+    """
     dtype = freqs.dtype
     freqs = freqs.float()
     freqs_x = (t_x.unsqueeze(-1) @ freqs[0].unsqueeze(-2))
     freqs_y = (t_y.unsqueeze(-1) @ freqs[1].unsqueeze(-2))
-    combined = freqs_x + freqs_y  # shape: (num_heads, N, dim//4)
-    sin_emb = torch.sin(combined).repeat_interleave(2, -1)  # (N, dim//2)
-    cos_emb = torch.cos(combined).repeat_interleave(2, -1)  # (N, dim//2)
-    rope_embeds = torch.cat([sin_emb, cos_emb], dim=-1)  # (num_heads, H*W, head_dim)
+    combined = freqs_x + freqs_y  # shape: (depth, num_heads, N, head_dim//2)
+    sin_emb = torch.sin(combined).repeat_interleave(2, -1)  # (depth, num_heads, N, head_dim)
+    cos_emb = torch.cos(combined).repeat_interleave(2, -1)  # (depth, num_heads, N, head_dim)
+    rope_embeds = torch.cat([sin_emb, cos_emb], dim=-1)  # (depth, num_heads, N, head_dim*2)
     return rope_embeds.to(dtype)
+
+
+def get_mixed_freqs_from_coords(
+        freqs: torch.Tensor,
+        coords: torch.Tensor,
+        grid_indexing: str = 'xy',
+) -> torch.Tensor:
+    """Compute mixed (learnable) frequencies from arbitrary continuous 2D coordinates.
+
+    This function allows computing learnable RoPE embeddings for floating-point positions,
+    enabling use cases like sub-pixel positions, interpolated positions, or
+    non-uniform spatial sampling with learned frequency parameters.
+
+    Args:
+        freqs: Learnable frequency parameters of shape (2, depth, num_heads, head_dim//2)
+        coords: Tensor of shape (N, 2) with continuous 2D positions. The coordinate order
+            follows grid_indexing: 'xy' means (x, y) order, 'ij' means (row, col) order.
+        grid_indexing: Coordinate ordering convention ('xy' or 'ij')
+
+    Returns:
+        Tensor of shape (depth, num_heads, N, head_dim*2) with concatenated sin/cos embeddings
+    """
+    if grid_indexing == 'xy':
+        # coords are (x, y) order, but internal convention is (first_grid_dim, second_grid_dim)
+        t_x = coords[:, 0]
+        t_y = coords[:, 1]
+    else:  # 'ij'
+        # coords are (row, col) order
+        t_x = coords[:, 0]
+        t_y = coords[:, 1]
+
+    return get_mixed_freqs(freqs, t_x, t_y)
 
 
 class RotaryEmbeddingMixed(nn.Module):
@@ -823,7 +1000,7 @@ class RotaryEmbeddingMixed(nn.Module):
             shape: Spatial dimensions [H, W]
 
         Returns:
-            Tensor of shape (depth, H*W, dim) containing concatenated sin/cos embeddings
+            Tensor of shape (depth, num_heads, H*W, head_dim*2) containing concatenated sin/cos embeddings
         """
         if shape is not None:
             t_x, t_y = get_mixed_grid(
@@ -837,6 +1014,49 @@ class RotaryEmbeddingMixed(nn.Module):
             assert False, "get_embed() requires pre-computed t_x/t_y or valid shape"
 
         return get_mixed_freqs(self.freqs, t_x, t_y)
+
+    def get_embed_from_coords(
+            self,
+            coords: torch.Tensor,
+    ) -> torch.Tensor:
+        """Generate learnable RoPE embeddings for arbitrary continuous 2D coordinates.
+
+        This method allows computing RoPE embeddings with learned frequencies for
+        floating-point positions, enabling use cases like sub-pixel positions,
+        interpolated positions, or non-uniform spatial sampling.
+
+        Args:
+            coords: Tensor of shape (N, 2) or (B, N, 2) with continuous 2D positions.
+                Positions can be any floating-point values. The coordinate order follows
+                self.grid_indexing: 'xy' means (x, y), 'ij' means (row, col).
+
+        Returns:
+            If coords is (N, 2): Tensor of shape (depth, num_heads, N, head_dim*2)
+            If coords is (B, N, 2): Tensor of shape (B, depth, num_heads, N, head_dim*2)
+            Contains concatenated [sin, cos] embeddings with learned frequencies.
+        """
+        input_ndim = coords.ndim
+        if input_ndim == 2:
+            # (N, 2) -> compute directly
+            return get_mixed_freqs_from_coords(
+                self.freqs,
+                coords.to(self.freqs.device),
+                grid_indexing=self.grid_indexing,
+            )
+        elif input_ndim == 3:
+            # (B, N, 2) -> process each batch item
+            B, N, _ = coords.shape
+            results = []
+            for b in range(B):
+                embed = get_mixed_freqs_from_coords(
+                    self.freqs,
+                    coords[b].to(self.freqs.device),
+                    grid_indexing=self.grid_indexing,
+                )
+                results.append(embed)
+            return torch.stack(results, dim=0)  # (B, depth, num_heads, N, head_dim*2)
+        else:
+            raise ValueError(f"coords must be 2D (N, 2) or 3D (B, N, 2), got {input_ndim}D")
 
     def get_batch_embeds(
             self,
